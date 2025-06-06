@@ -1,132 +1,140 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from pinnstorch.models import PINN
-from pinnstorch.domain import Domain, BoundaryCondition
+from scipy.stats import qmc
 
-def generate_training_data(n_theta=250, n_r=30):
-    # 生成极坐标网格
-    r_inner = 1.8  # mm
-    r_outer = 3.4  # mm
-    theta = np.linspace(0, 2*np.pi, n_theta)
-    r = np.linspace(r_inner, r_outer, n_r)
-    
-    # 生成网格点
-    theta_grid, r_grid = np.meshgrid(theta, r)
-    
-    # 生成随机压力和厚度数据
-    pressure = np.random.uniform(0.1, 1.0, size=(n_r, n_theta))
-    thickness = np.random.uniform(0.01, 0.1, size=(n_r, n_theta))
-    
-    return theta_grid, r_grid, pressure, thickness
+class PINN(nn.Module):
+    def __init__(self):
+        super(PINN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 50),
+            nn.Tanh(),
+            nn.Linear(50, 50),
+            nn.Tanh(),
+            nn.Linear(50, 50),
+            nn.Tanh(),
+            nn.Linear(50, 2)  # 输出压力和厚度
+        )
+        
+    def forward(self, r, theta):
+        x = torch.cat([r, theta], dim=1)
+        return self.net(x)
 
-def oil_film_pde(model, x):
-    """
-    油膜雷诺方程的PDE约束
-    """
-    r, theta = x[:, 0:1], x[:, 1:2]
+def generate_training_data(n_samples=1000):
+    # 生成极坐标下的训练数据
+    r_inner = 0.9  # 内径1.8mm的一半
+    r_outer = 1.7  # 外径3.4mm的一半
     
-    # 计算压力和厚度对r和theta的导数
-    p = model(x)
-    h = p[:, 1:2]  # 厚度
-    p = p[:, 0:1]  # 压力
+    # 使用拉丁超立方采样
+    sampler = qmc.LatinHypercube(d=2)
+    samples = sampler.random(n_samples)
     
-    # 计算一阶导数
-    dp_dr = torch.autograd.grad(p, r, grad_outputs=torch.ones_like(p), create_graph=True)[0]
-    dp_dtheta = torch.autograd.grad(p, theta, grad_outputs=torch.ones_like(p), create_graph=True)[0]
-    dh_dr = torch.autograd.grad(h, r, grad_outputs=torch.ones_like(h), create_graph=True)[0]
-    dh_dtheta = torch.autograd.grad(h, theta, grad_outputs=torch.ones_like(h), create_graph=True)[0]
+    # 转换到极坐标范围
+    r = r_inner + (r_outer - r_inner) * samples[:, 0]
+    theta = 2 * np.pi * samples[:, 1]
     
-    # 计算二阶导数
-    d2p_dr2 = torch.autograd.grad(dp_dr, r, grad_outputs=torch.ones_like(dp_dr), create_graph=True)[0]
-    d2p_dtheta2 = torch.autograd.grad(dp_dtheta, theta, grad_outputs=torch.ones_like(dp_dtheta), create_graph=True)[0]
+    # 生成模拟的压力和厚度数据
+    # 这里使用简单的解析解作为示例
+    pressure = 1.0 - (r - r_inner) / (r_outer - r_inner)  # 线性压力分布
+    thickness = 0.1 * (1 + 0.5 * np.sin(theta))  # 正弦变化的厚度分布
     
-    # 简化的雷诺方程
-    residual = d2p_dr2 + (1/r**2)*d2p_dtheta2 + (1/r)*dp_dr - 12*eta*(dh_dr/r + dh_dtheta/(r**2))
-    
-    return residual
+    return torch.tensor(r, dtype=torch.float32), torch.tensor(theta, dtype=torch.float32), \
+           torch.tensor(pressure, dtype=torch.float32), torch.tensor(thickness, dtype=torch.float32)
 
-def main():
-    # 设置随机种子
-    torch.manual_seed(42)
-    np.random.seed(42)
+def physics_loss(model, r, theta):
+    # 计算物理损失（简化版）
+    r.requires_grad_(True)
+    theta.requires_grad_(True)
     
-    # 生成训练数据
-    theta_grid, r_grid, pressure, thickness = generate_training_data()
+    output = model(r, theta)
+    pressure, thickness = output[:, 0], output[:, 1]
     
-    # 定义计算域
-    domain = Domain(
-        x_min=[1.8, 0],  # r_min, theta_min
-        x_max=[3.4, 2*np.pi],  # r_max, theta_max
-        n_points=[30, 250]  # n_r, n_theta
-    )
+    # 计算压力梯度
+    dp_dr = torch.autograd.grad(pressure, r, grad_outputs=torch.ones_like(pressure),
+                               create_graph=True)[0]
     
-    # 定义边界条件
-    bc_inner = BoundaryCondition(
-        x_min=[1.8, 0],
-        x_max=[1.8, 2*np.pi],
-        n_points=[1, 250],
-        value=1.0  # 内壁压力入口
-    )
+    # 简化的雷诺方程损失
+    loss = torch.mean(dp_dr**2)
     
-    bc_outer = BoundaryCondition(
-        x_min=[3.4, 0],
-        x_max=[3.4, 2*np.pi],
-        n_points=[1, 250],
-        value=0.0  # 外壁压力出口
-    )
+    return loss
+
+def train_model(model, n_epochs=1000):
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
-    # 创建PINN模型
-    model = PINN(
-        input_dim=2,  # r, theta
-        output_dim=2,  # pressure, thickness
-        hidden_layers=[20, 20, 20, 20],
-        activation='tanh'
-    )
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+        
+        # 生成训练数据
+        r, theta, p_true, h_true = generate_training_data(1000)
+        
+        # 模型预测
+        p_pred, h_pred = model(r.unsqueeze(1), theta.unsqueeze(1)).T
+        
+        # 数据损失
+        data_loss = torch.mean((p_pred - p_true)**2 + (h_pred - h_true)**2)
+        
+        # 物理损失
+        phys_loss = physics_loss(model, r.unsqueeze(1), theta.unsqueeze(1))
+        
+        # 总损失
+        loss = data_loss + 0.1 * phys_loss
+        
+        loss.backward()
+        optimizer.step()
+        
+        if epoch % 100 == 0:
+            print(f'Epoch {epoch}, Loss: {loss.item():.6f}')
+
+def visualize_results(model):
+    # 创建预测网格
+    r_inner, r_outer = 0.9, 1.7
+    r = np.linspace(r_inner, r_outer, 30)
+    theta = np.linspace(0, 2*np.pi, 250)
+    R, Theta = np.meshgrid(r, theta)
     
-    # 设置PDE约束
-    model.set_pde(oil_film_pde)
+    # 转换为笛卡尔坐标用于绘图
+    X = R * np.cos(Theta)
+    Y = R * np.sin(Theta)
     
-    # 设置边界条件
-    model.set_boundary_conditions([bc_inner, bc_outer])
-    
-    # 训练模型
-    model.train(
-        epochs=1000,
-        learning_rate=0.001,
-        batch_size=1000
-    )
-    
-    # 预测结果
-    r = torch.tensor(r_grid.flatten(), dtype=torch.float32).reshape(-1, 1)
-    theta = torch.tensor(theta_grid.flatten(), dtype=torch.float32).reshape(-1, 1)
-    x = torch.cat([r, theta], dim=1)
+    # 预测压力和厚度
+    r_tensor = torch.tensor(R.flatten(), dtype=torch.float32).unsqueeze(1)
+    theta_tensor = torch.tensor(Theta.flatten(), dtype=torch.float32).unsqueeze(1)
     
     with torch.no_grad():
-        predictions = model(x)
-    
-    # 重塑预测结果
-    pressure_pred = predictions[:, 0].reshape(r_grid.shape)
-    thickness_pred = predictions[:, 1].reshape(r_grid.shape)
+        predictions = model(r_tensor, theta_tensor)
+        pressure = predictions[:, 0].reshape(R.shape)
+        thickness = predictions[:, 1].reshape(R.shape)
     
     # 绘制结果
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
     # 压力分布
-    im1 = ax1.pcolormesh(theta_grid, r_grid, pressure_pred, shading='auto')
-    ax1.set_title('预测压力分布')
+    im1 = ax1.pcolormesh(X, Y, pressure, shading='auto', cmap='viridis')
+    ax1.set_title('压力分布')
     plt.colorbar(im1, ax=ax1)
     
     # 厚度分布
-    im2 = ax2.pcolormesh(theta_grid, r_grid, thickness_pred, shading='auto')
-    ax2.set_title('预测厚度分布')
+    im2 = ax2.pcolormesh(X, Y, thickness, shading='auto', cmap='plasma')
+    ax2.set_title('厚度分布')
     plt.colorbar(im2, ax=ax2)
     
     plt.tight_layout()
     plt.savefig('prediction_results.png')
     plt.close()
+
+def main():
+    # 创建模型
+    model = PINN()
     
-    print("训练完成，结果已保存为 prediction_results.png")
+    # 训练模型
+    print("开始训练模型...")
+    train_model(model)
+    
+    # 可视化结果
+    print("生成预测结果可视化...")
+    visualize_results(model)
+    print("完成！结果已保存到 prediction_results.png")
 
 if __name__ == "__main__":
     main()
